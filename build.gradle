@@ -1,0 +1,110 @@
+// Spring Boot 앱의 API 요청·응답을 jsonl 파일로 기록하고, 조회 API와 화면을 제공하는 자동 설정 라이브러리.
+import com.vanniktech.maven.publish.JavaLibrary
+import com.vanniktech.maven.publish.JavadocJar
+
+plugins {
+	id 'java-library'
+	id 'io.spring.dependency-management' version '1.1.7'
+	id 'com.vanniktech.maven.publish' version '0.37.0'
+}
+
+group = 'io.github.h0l1da2'
+version = findProperty('releaseVersion') ?: '0.1.0-SNAPSHOT'
+
+java {
+	toolchain {
+		languageVersion = JavaLanguageVersion.of(26)
+	}
+}
+
+repositories {
+	mavenCentral()
+}
+
+dependencyManagement {
+	imports {
+		mavenBom 'org.springframework.boot:spring-boot-dependencies:4.0.5'
+	}
+}
+
+dependencies {
+	api 'org.springframework.boot:spring-boot-autoconfigure'
+	implementation 'tools.jackson.core:jackson-databind'
+
+	// 웹·보안은 쓰는 앱이 가진 버전을 그대로 쓴다
+	compileOnly 'org.springframework:spring-webmvc'
+	compileOnly 'jakarta.servlet:jakarta.servlet-api'
+	compileOnly 'org.springframework.security:spring-security-core'
+
+	testImplementation 'org.springframework.boot:spring-boot-starter-test'
+	testImplementation 'org.springframework:spring-webmvc'
+	testImplementation 'jakarta.servlet:jakarta.servlet-api'
+	testImplementation 'org.springframework.security:spring-security-core'
+	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.withType(JavaCompile).configureEach {
+	options.encoding = 'UTF-8'
+	// 빌드는 JDK 26으로 하되, Java 21 이상 앱이면 쓸 수 있게 바이트코드는 21로 맞춘다
+	options.release = 21
+	// Boot 플러그인을 쓰지 않으므로 -parameters를 직접 켠다 (@PathVariable 이름 생략 대응)
+	options.compilerArgs.add('-parameters')
+}
+
+tasks.withType(Javadoc).configureEach {
+	options.encoding = 'UTF-8'
+	options.addStringOption('Xdoclint:none', '-quiet')
+}
+
+tasks.named('test') {
+	useJUnitPlatform()
+}
+
+// BOM(dependencyManagement)으로 받은 버전은 Gradle 모듈 메타데이터에 안 들어가서 배포 검증에 걸린다.
+// 실제로 해석된 버전을 그대로 적어 배포한다.
+publishing {
+	publications.withType(MavenPublication).configureEach {
+		versionMapping {
+			usage('java-api') {
+				fromResolutionOf('runtimeClasspath')
+			}
+			usage('java-runtime') {
+				fromResolutionResult()
+			}
+		}
+	}
+}
+
+mavenPublishing {
+	configure(new JavaLibrary(new JavadocJar.Javadoc(), true))
+	publishToMavenCentral()
+	signAllPublications()
+
+	coordinates('io.github.h0l1da2', 'api-logs', version.toString())
+
+	pom {
+		name = 'api-logs'
+		description = 'Spring Boot auto-configuration that records API requests/responses to jsonl files and serves a viewer page.'
+		url = 'https://github.com/h0l1da2/api-logs'
+		inceptionYear = '2026'
+		licenses {
+			license {
+				name = 'The Apache License, Version 2.0'
+				url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
+				distribution = 'repo'
+			}
+		}
+		developers {
+			developer {
+				id = 'h0l1da2'
+				name = 'h0l1da2'
+				url = 'https://github.com/h0l1da2'
+			}
+		}
+		scm {
+			url = 'https://github.com/h0l1da2/api-logs'
+			connection = 'scm:git:git://github.com/h0l1da2/api-logs.git'
+			developerConnection = 'scm:git:ssh://git@github.com/h0l1da2/api-logs.git'
+		}
+	}
+}

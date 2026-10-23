@@ -1,0 +1,27 @@
+# GitHub에서 Release(태그 v0.1.0 등)를 publish하면 Maven Central에 배포한다.
+# 버전은 태그에서 앞의 'v'를 뗀 값을 쓴다.
+name: Publish
+on:
+  release:
+    types: [published]
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '26'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Test
+        run: ./gradlew build
+      - name: Publish to Maven Central
+        run: ./gradlew publishAndReleaseToMavenCentral -PreleaseVersion="${GITHUB_REF_NAME#v}" --no-configuration-cache
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_PASSWORD }}
