@@ -38,17 +38,26 @@ public record ApiAccessLogProperties(
         @DefaultValue("X-Request-Id") String requestIdHeader
 ) {
 
-    /** 이름·전화번호(개인정보)와 비밀번호·토큰(보안 비밀). 키 이름이 정확히 일치할 때만 가린다. */
+    /**
+     * 이름·전화번호·주민번호(개인정보)와 비밀번호·토큰(보안 비밀).
+     * 대소문자와 _·-는 무시하고 비교하므로 {@code userName}이 {@code user_name}, {@code USER_NAME}도 가린다.
+     */
     public static final List<String> DEFAULT_MASK_KEYS = List.of(
+            // 이름 (Admin API + EMON 회원·훈련생·첨삭강사)
             "name", "managerName", "approverUsername", "configuredByName",
-            "phoneNumber",
+            "userName", "encptUserName", "trpNm", "correctTutorName",
+            // 휴대폰·연락처
+            "phoneNumber", "mobile", "encptMobile", "hpNo", "tel", "telNo",
+            // 주민등록번호
+            "resNo", "encptResNo",
             "password", "passwordConfirm", "newPassword", "currentPassword",
             "accessToken", "refreshToken", "apiKey", "secret", "token"
     );
 
-    /** 키를 모르는 값도 휴대폰 번호 형식이면 가린다. */
+    /** 키를 모르는 값도 휴대폰 번호·주민등록번호(13자리, 생년월일 유효 범위) 형식이면 가린다. */
     public static final List<String> DEFAULT_MASK_PATTERNS = List.of(
-            "01[016789]-?\\d{3,4}-?\\d{4}"
+            "01[016789]-?\\d{3,4}-?\\d{4}",
+            "(?<!\\d)\\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\\d|3[01])-?[1-8]\\d{6}(?!\\d)"
     );
 
     /** jsonl 파일을 저장할 폴더. */

@@ -23,6 +23,7 @@ public class CapturingRequestWrapper extends HttpServletRequestWrapper {
 
     private final int limit;
     private final ByteArrayOutputStream captured;
+    private long totalBytes;
     private ServletInputStream inputStream;
     private BufferedReader reader;
 
@@ -62,7 +63,19 @@ public class CapturingRequestWrapper extends HttpServletRequestWrapper {
         return captured.toByteArray();
     }
 
+    /**
+     * 앱이 지금까지 읽은 본문 전체 바이트 수. 상한과 관계없이 센다.
+     * chunked 요청처럼 Content-Length가 없을 때 원래 크기와 잘림 여부를 판단하는 데 쓴다.
+     * 앱이 본문을 끝까지 읽지 않았다면 실제 크기보다 작다.
+     */
+    public long totalBytes() {
+        return totalBytes;
+    }
+
     private void capture(byte[] bytes, int offset, int length) {
+        if (length > 0) {
+            totalBytes += length;
+        }
         final int room = limit - captured.size();
         if (room > 0 && length > 0) {
             captured.write(bytes, offset, Math.min(room, length));
