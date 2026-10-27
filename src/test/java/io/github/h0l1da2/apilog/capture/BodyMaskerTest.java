@@ -31,6 +31,40 @@ class BodyMaskerTest {
     }
 
     @Test
+    @DisplayName("EMON 회원정보 키는 snake_case·대문자여도 가린다")
+    void masksEmonPersonalKeysRegardlessOfCase() {
+        final String masked = masker.maskBody("""
+                {"rows":[{"user_id":"u1","user_name":"홍길동","RES_NO":"6901012","encpt_user_name":"김철수",
+                  "mobile":"010-2222-3333","TEL_NO":"02-123-4567","HP_NO":"01055556666","TRP_NM":"이영희",
+                  "correct_tutor_name":"박강사","encpt_res_no":"enc-abc","userName":"최민수"}]}""", true, false);
+
+        assertThat(masked)
+                .contains("\"user_id\":\"u1\"")
+                .contains("\"user_name\":\"***\"")
+                .contains("\"RES_NO\":\"***\"")
+                .doesNotContain("홍길동", "6901012", "김철수", "010-2222-3333", "02-123-4567",
+                        "01055556666", "이영희", "박강사", "enc-abc", "최민수");
+    }
+
+    @Test
+    @DisplayName("키를 몰라도 주민등록번호 형식의 값은 가리고, 비슷한 긴 숫자는 남긴다")
+    void masksResidentNumberPatternInValues() {
+        final String masked = masker.maskBody(
+                "{\"memo\":\"주민 900101-1234567, 9001012234567\",\"ts\":1761523200000}", true, false);
+
+        assertThat(masked).doesNotContain("900101-1234567", "9001012234567").contains("1761523200000");
+    }
+
+    @Test
+    @DisplayName("잘린 JSON·폼에서도 대소문자 무관하게 개인정보 키를 가린다")
+    void masksPersonalKeysInTruncatedJsonAndForm() {
+        assertThat(masker.maskBody("{\"USER_NAME\":\"홍길동\",\"res_no\":\"6901012\",\"page\":1,\"data\":[", true, false))
+                .doesNotContain("홍길동", "6901012").contains("\"page\":1");
+        assertThat(masker.maskQuery("user_name=%ED%99%8D&hp_no=0101&page=1"))
+                .isEqualTo("user_name=***&hp_no=***&page=1");
+    }
+
+    @Test
     @DisplayName("사람 이름이 아닌 *Name 필드는 가리지 않는다")
     void keepsNonPersonNameFields() {
         final String masked = masker.maskBody(

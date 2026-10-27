@@ -6,6 +6,8 @@ import io.github.h0l1da2.apilog.spi.CallerResolver;
 import io.github.h0l1da2.apilog.store.ApiAccessLogRecord;
 import io.github.h0l1da2.apilog.store.ApiAccessLogSink;
 import io.github.h0l1da2.apilog.support.Ulid;
+import jakarta.servlet.AsyncEvent;
+import jakarta.servlet.AsyncListener;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -20,6 +22,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -32,7 +35,9 @@ import org.springframework.web.servlet.HandlerMapping;
  *
  * 책임:
  * - 요청·응답 모두 흘려보내며 앞부분만 복사한다. 앱이 보는 요청·응답(인코딩 포함)은 바꾸지 않는다
- * - SSE·비동기·멀티파트·바이너리는 본문 없이 메타 정보만 남긴다 ({@code skipReason})
+ * - 멀티파트·바이너리는 본문 없이 메타 정보만 남긴다 ({@code skipReason})
+ * - SSE는 스트림 전체를 복사하지 않고 마지막 종료 이벤트(done/error)의 data만 응답 본문으로 남긴다
+ * - 비동기 요청(SSE 포함)은 첫 디스패치가 끝난 시점이 아니라 비동기 처리가 끝났을 때 기록한다
  * - 저장 전에 마스킹과 자르기를 끝낸다
  *
  * 주의:
@@ -73,41 +78,106 @@ public class ApiAccessLogFilter extends OncePerRequestFilter {
         final HttpServletRequest requestToUse = cacheRequestBody
                 ? new CapturingRequestWrapper(request, properties.maxBodyBytes())
                 : request;
-        final CapturingResponseWrapper responseToUse =
-                new CapturingResponseWrapper(response, properties.maxBodyBytes());
+        final CapturingResponseWrapper responseToUse = new CapturingResponseWrapper(response,
+                properties.maxBodyBytes(), initialResponseMode(request), policy::isTextual, policy::isEventStream);
 
         Throwable failure = null;
+        boolean deferred = false;
         try {
             chain.doFilter(requestToUse, responseToUse);
+            deferred = requestToUse.isAsyncStarted() && deferUntilAsyncComplete(requestToUse, responseToUse,
+                    startMillis, startNanos);
         } catch (IOException | ServletException | RuntimeException | Error e) {
             failure = e;
             throw e;
         } finally {
-            responseToUse.flushWriterQuietly();
-            try {
-                sink.offer(buildRecord(requestToUse, responseToUse, startMillis, startNanos, failure));
-            } catch (RuntimeException e) {
-                log.debug("API 호출 기록을 만들지 못했습니다: " + e.getClass().getSimpleName());
+            if (!deferred) {
+                responseToUse.flushWriterQuietly();
+                offer(requestToUse, responseToUse, startMillis, startNanos, failure, null);
             }
         }
     }
 
+    /**
+     * 처음부터 응답 캡처 방식을 정한다. 이 시점엔 route를 모르므로 실제 경로로 본문 정책을 본다.
+     * - 응답 본문을 저장하지 않는 정책이면 복사하지 않는다
+     * - SSE 요청이면 Content-Type이 확정될 때까지 복사하지 않는다 (확정되면 종료 이벤트만 보관)
+     */
+    private CapturingResponseWrapper.Mode initialResponseMode(HttpServletRequest request) {
+        if (policy.bodyPolicyFor(null, pathWithinApplication(request)) != BodyPolicy.FULL) {
+            return CapturingResponseWrapper.Mode.COUNT_ONLY;
+        }
+        return acceptsEventStream(request)
+                ? CapturingResponseWrapper.Mode.EXPECT_EVENT_STREAM
+                : CapturingResponseWrapper.Mode.AUTO;
+    }
+
+    /** 비동기 처리가 끝나면 한 번만 기록하도록 리스너를 건다. 걸지 못하면 false (즉시 기록). */
+    private boolean deferUntilAsyncComplete(HttpServletRequest request, CapturingResponseWrapper response,
+                                            long startMillis, long startNanos) {
+        try {
+            request.getAsyncContext().addListener(new AsyncListener() {
+                private final AtomicBoolean recorded = new AtomicBoolean();
+                private volatile Throwable error;
+                private volatile boolean timedOut;
+
+                @Override
+                public void onComplete(AsyncEvent event) {
+                    if (recorded.compareAndSet(false, true)) {
+                        response.flushWriterQuietly();
+                        offer(request, response, startMillis, startNanos, error,
+                                timedOut && error == null ? "비동기 처리 시간 초과" : null);
+                    }
+                }
+
+                @Override
+                public void onTimeout(AsyncEvent event) {
+                    timedOut = true;
+                }
+
+                @Override
+                public void onError(AsyncEvent event) {
+                    error = event.getThrowable();
+                }
+
+                @Override
+                public void onStartAsync(AsyncEvent event) {
+                    // 같은 요청에서 비동기를 다시 시작하면 리스너가 빠지므로 다시 건다
+                    event.getAsyncContext().addListener(this);
+                }
+            });
+            return true;
+        } catch (RuntimeException e) {
+            log.debug("비동기 완료 리스너를 걸지 못해 즉시 기록합니다: " + e.getClass().getSimpleName());
+            return false;
+        }
+    }
+
+    private void offer(HttpServletRequest request, CapturingResponseWrapper response,
+                       long startMillis, long startNanos, Throwable failure, String asyncError) {
+        try {
+            sink.offer(buildRecord(request, response, startMillis, startNanos, failure, asyncError));
+        } catch (RuntimeException e) {
+            log.debug("API 호출 기록을 만들지 못했습니다: " + e.getClass().getSimpleName());
+        }
+    }
+
     private ApiAccessLogRecord buildRecord(HttpServletRequest request, CapturingResponseWrapper response,
-                                           long startMillis, long startNanos, Throwable failure) {
+                                           long startMillis, long startNanos, Throwable failure,
+                                           String asyncError) {
         final String path = pathWithinApplication(request);
         final String route = (String) request.getAttribute(HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE);
         final BodyPolicy bodyPolicy = policy.bodyPolicyFor(route, path);
         final String requestContentType = request.getContentType();
         final String responseContentType = response.getContentType();
-        final boolean async = request.isAsyncStarted();
-        final boolean eventStream = policy.isEventStream(responseContentType)
-                || acceptsEventStream(request);
+        final CapturingResponseWrapper.Mode responseMode = response.mode();
+        final boolean eventStream = responseMode == CapturingResponseWrapper.Mode.EVENT_STREAM
+                || policy.isEventStream(responseContentType);
 
         String skipReason = null;
+        String error = errorOf(request, failure);
         if (eventStream) {
             skipReason = "SSE";
-        } else if (async) {
-            skipReason = "ASYNC";
         } else if (policy.isMultipart(requestContentType)) {
             skipReason = "MULTIPART";
         }
@@ -123,7 +193,11 @@ public class ApiAccessLogFilter extends OncePerRequestFilter {
                 bytes = formFromParameters(request).getBytes(StandardCharsets.UTF_8);
             }
             final long declared = request.getContentLengthLong();
-            requestBodyBytes = declared >= 0 ? declared : bytes.length;
+            // Content-Length가 없으면(chunked 등) 래퍼가 상한과 관계없이 센 전체 읽은 바이트 수를 쓴다.
+            // capturedBytes()는 상한까지만 보관하므로 그 길이로는 잘림을 알 수 없다.
+            // 폼처럼 컨테이너가 본문을 직접 읽어 래퍼가 세지 못한 경우에만 재구성한 길이를 쓴다
+            requestBodyBytes = declared >= 0 ? declared
+                    : cached.totalBytes() > 0 ? cached.totalBytes() : bytes.length;
             truncated = requestBodyBytes > properties.maxBodyBytes();
             if (bodyPolicy != BodyPolicy.NONE && bytes.length > 0) {
                 requestBody = masker.maskBody(
@@ -138,8 +212,21 @@ public class ApiAccessLogFilter extends OncePerRequestFilter {
         // 응답 본문
         String responseBody = null;
         final Long responseBodyBytes = response.totalBytes();
-        if (skipReason == null && bodyPolicy == BodyPolicy.FULL) {
-            if (policy.isTextual(responseContentType)) {
+        if (eventStream && bodyPolicy == BodyPolicy.FULL) {
+            // SSE는 마지막 종료 이벤트(done/error)의 data만 남긴다
+            final SseTerminalEventCapture.TerminalEvent terminal = response.lastTerminalEvent();
+            if (terminal == null) {
+                skipReason = "SSE_NO_DONE";
+            } else {
+                responseBody = masker.maskBody(new String(terminal.data(), StandardCharsets.UTF_8),
+                        true, false);
+                truncated = truncated || terminal.totalBytes() > properties.maxBodyBytes();
+                if ("error".equals(terminal.name()) && error == null) {
+                    error = "SSE error 이벤트로 종료";
+                }
+            }
+        } else if (skipReason == null && bodyPolicy == BodyPolicy.FULL) {
+            if (responseMode == CapturingResponseWrapper.Mode.BUFFER && policy.isTextual(responseContentType)) {
                 final byte[] bytes = response.capturedBytes();
                 if (bytes.length > 0) {
                     responseBody = masker.maskBody(
@@ -176,7 +263,7 @@ public class ApiAccessLogFilter extends OncePerRequestFilter {
                 responseBodyBytes,
                 truncated,
                 skipReason,
-                errorOf(request, failure));
+                error != null ? error : asyncError);
     }
 
     private String errorOf(HttpServletRequest request, Throwable failure) {

@@ -18,7 +18,8 @@ import tools.jackson.databind.node.ObjectNode;
  * 저장 전에 본문·쿼리·헤더·예외 메시지의 민감한 값을 가린다.
  *
  * 규칙:
- * - 키 마스킹: {@code mask-keys}와 이름이 정확히 같은 JSON 필드·폼 파라미터 값을 {@value #MASK}로 바꾼다
+ * - 키 마스킹: {@code mask-keys}와 이름이 같은 JSON 필드·폼 파라미터 값을 {@value #MASK}로 바꾼다.
+ *   대소문자와 {@code _}·{@code -}는 무시하고 비교한다 ({@code userName} = {@code user_name} = {@code USER_NAME})
  * - 값 패턴 마스킹: {@code mask-patterns}에 맞는 부분 문자열을 {@value #MASK}로 바꾼다 (키를 모르는 값 대비)
  * - JSON이 잘려 파싱되지 않으면 정규식으로 {@code "key":"value"} 형태를 찾아 가린다
  *
@@ -39,11 +40,10 @@ public class BodyMasker {
 
     public BodyMasker(ApiAccessLogProperties properties, ObjectMapper mapper) {
         this.mapper = mapper;
-        this.maskKeys = Set.copyOf(properties.maskKeys());
+        this.maskKeys = properties.maskKeys().stream().map(BodyMasker::normalizeKey).collect(Collectors.toUnmodifiableSet());
         this.valuePatterns = properties.maskPatterns().stream().map(Pattern::compile).toList();
-        final String keys = maskKeys.stream().map(Pattern::quote).collect(Collectors.joining("|"));
-        // "key" : "value"  /  "key" : 123  형태. 잘린 JSON에서도 동작한다
-        this.jsonKeyPattern = Pattern.compile("\"(" + keys + ")\"(\\s*:\\s*)(\"(?:[^\"\\\\]|\\\\.)*\"?|[^,}\\]\\s]+)");
+        // "key" : "value"  /  "key" : 123  형태. 잘린 JSON에서도 동작한다. 키 일치 여부는 치환 시 판단한다
+        this.jsonKeyPattern = Pattern.compile("\"((?:[^\"\\\\]|\\\\.)+)\"(\\s*:\\s*)(\"(?:[^\"\\\\]|\\\\.)*\"?|[^,}\\]\\s]+)");
     }
 
     public String maskBody(String body, boolean json, boolean form) {
@@ -84,7 +84,16 @@ public class BodyMasker {
 
     private boolean isMaskedHeader(String name) {
         final String lower = name.toLowerCase(Locale.ROOT);
-        return ALWAYS_MASKED_HEADERS.contains(lower) || maskKeys.contains(name);
+        return ALWAYS_MASKED_HEADERS.contains(lower) || isMaskedKey(name);
+    }
+
+    private boolean isMaskedKey(String key) {
+        return key != null && maskKeys.contains(normalizeKey(key));
+    }
+
+    /** 대소문자와 구분자(_, -)를 무시하고 비교하기 위한 정규화. */
+    static String normalizeKey(String key) {
+        return key.replace("_", "").replace("-", "").toLowerCase(Locale.ROOT);
     }
 
     private String maskJson(String body) {
@@ -107,7 +116,7 @@ public class BodyMasker {
             final List<String> names = object.properties().stream().map(Map.Entry::getKey).toList();
             for (String name : names) {
                 final JsonNode child = object.get(name);
-                if (maskKeys.contains(name) && child != null && !child.isNull()) {
+                if (isMaskedKey(name) && child != null && !child.isNull()) {
                     object.put(name, MASK);
                 } else if (child != null) {
                     maskNode(child);
@@ -128,6 +137,10 @@ public class BodyMasker {
         final Matcher matcher = jsonKeyPattern.matcher(body);
         final StringBuilder out = new StringBuilder(body.length());
         while (matcher.find()) {
+            if (!isMaskedKey(matcher.group(1))) {
+                matcher.appendReplacement(out, Matcher.quoteReplacement(matcher.group()));
+                continue;
+            }
             matcher.appendReplacement(out, Matcher.quoteReplacement(
                     "\"" + matcher.group(1) + "\"" + matcher.group(2) + "\"" + MASK + "\""));
         }
@@ -145,7 +158,7 @@ public class BodyMasker {
             final String pair = pairs[i];
             final int eq = pair.indexOf('=');
             final String key = eq < 0 ? pair : pair.substring(0, eq);
-            if (eq >= 0 && maskKeys.contains(java.net.URLDecoder.decode(key, StandardCharsets.UTF_8))) {
+            if (eq >= 0 && isMaskedKey(java.net.URLDecoder.decode(key, StandardCharsets.UTF_8))) {
                 out.append(key).append('=').append(MASK);
             } else {
                 out.append(pair);

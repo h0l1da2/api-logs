@@ -9,6 +9,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import io.github.h0l1da2.apilog.ApiAccessLogProperties;
 import io.github.h0l1da2.apilog.TestProperties;
 import io.github.h0l1da2.apilog.store.ApiAccessLogRecord;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -16,6 +17,9 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.mock.web.MockAsyncContext;
+import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -24,7 +28,6 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
-import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import tools.jackson.databind.json.JsonMapper;
 
 @DisplayName("API 호출 기록 필터")
@@ -93,14 +96,108 @@ class ApiAccessLogFilterTest {
     }
 
     @Test
-    @DisplayName("SSE는 본문 없이 메타 정보만 남기고 스트리밍은 그대로 동작한다")
-    void skipsEventStreamBody() throws Exception {
-        mockMvc().perform(get("/api/v1/stream").accept(MediaType.TEXT_EVENT_STREAM))
-                .andExpect(status().isOk());
+    @DisplayName("Content-Length 없는(chunked) 요청 본문이 상한보다 크면 잘림과 전체 크기를 기록한다")
+    void truncatesChunkedRequestBody() throws Exception {
+        final ApiAccessLogProperties props = TestProperties.of("max-body-bytes", "100");
+        final ApiAccessLogFilter filter = new ApiAccessLogFilter(props, new CapturePolicy(props),
+                new BodyMasker(props, JsonMapper.builder().build()), records::add);
+        final String body = "{\"data\":\"" + "x".repeat(500) + "\"}";
+        final MockHttpServletRequest request = new MockHttpServletRequest("POST", "/api/v1/chunked") {
+            @Override
+            public int getContentLength() {
+                return -1;
+            }
+
+            @Override
+            public long getContentLengthLong() {
+                return -1;
+            }
+        };
+        request.setContentType(MediaType.APPLICATION_JSON_VALUE);
+        request.setContent(body.getBytes(StandardCharsets.UTF_8));
+
+        filter.doFilter(request, new MockHttpServletResponse(),
+                (req, res) -> req.getInputStream().readAllBytes());
+
+        final ApiAccessLogRecord record = records.getFirst();
+        assertThat(record.reqBodyBytes()).isEqualTo((long) body.getBytes(StandardCharsets.UTF_8).length);
+        assertThat(record.truncated()).isTrue();
+    }
+
+    @Test
+    @DisplayName("SSE는 스트림이 끝난 뒤 done 이벤트 data만 마스킹해서 남기고, 클라이언트에는 전체를 보낸다")
+    void recordsOnlyDoneEventOfEventStream() throws Exception {
+        final String stream = "event:message\ndata:{\"text\":\"" + "중간청크".repeat(100) + "\"}\n\n"
+                + "event:done\ndata:{\"code\":\"START_SUCCESS\",\"data\":{\"user_name\":\"홍길동\"}}\n\n";
+        final MockHttpServletRequest request = sseRequest();
+        final MockHttpServletResponse response = new MockHttpServletResponse();
+
+        sseFilter("max-body-bytes", "200").doFilter(request, response, (req, res) -> {
+            req.startAsync(req, res);
+            res.setContentType(MediaType.TEXT_EVENT_STREAM_VALUE);
+            res.setCharacterEncoding("UTF-8");
+            res.getOutputStream().write(stream.getBytes(StandardCharsets.UTF_8));
+        });
+
+        assertThat(records).as("비동기가 끝나기 전에는 기록하지 않는다").isEmpty();
+        ((MockAsyncContext) request.getAsyncContext()).complete();
 
         final ApiAccessLogRecord record = records.getFirst();
         assertThat(record.skipReason()).isEqualTo("SSE");
+        assertThat(record.resBody())
+                .contains("START_SUCCESS")
+                .contains("\"user_name\":\"***\"")
+                .doesNotContain("중간청크", "홍길동");
+        assertThat(record.resBodyBytes()).isEqualTo((long) stream.getBytes(StandardCharsets.UTF_8).length);
+        assertThat(record.truncated()).isFalse();
+        assertThat(response.getContentAsString(StandardCharsets.UTF_8)).isEqualTo(stream);
+    }
+
+    @Test
+    @DisplayName("done 없이 끝난 SSE는 본문 없이 SSE_NO_DONE으로 남긴다")
+    void marksEventStreamWithoutDone() throws Exception {
+        final MockHttpServletRequest request = sseRequest();
+
+        sseFilter().doFilter(request, new MockHttpServletResponse(), (req, res) -> {
+            req.startAsync(req, res);
+            res.setContentType(MediaType.TEXT_EVENT_STREAM_VALUE);
+            res.getOutputStream().write("event:message\ndata:{\"text\":\"a\"}\n\n".getBytes(StandardCharsets.UTF_8));
+        });
+        ((MockAsyncContext) request.getAsyncContext()).complete();
+
+        final ApiAccessLogRecord record = records.getFirst();
+        assertThat(record.skipReason()).isEqualTo("SSE_NO_DONE");
         assertThat(record.resBody()).isNull();
+    }
+
+    @Test
+    @DisplayName("SSE error 이벤트로 끝나면 그 data와 에러 표시를 남긴다")
+    void recordsErrorEventOfEventStream() throws Exception {
+        final MockHttpServletRequest request = sseRequest();
+
+        sseFilter().doFilter(request, new MockHttpServletResponse(), (req, res) -> {
+            req.startAsync(req, res);
+            res.setContentType(MediaType.TEXT_EVENT_STREAM_VALUE);
+            res.getOutputStream().write("event:error\ndata:{\"message\":\"실패\"}\n\n".getBytes(StandardCharsets.UTF_8));
+        });
+        ((MockAsyncContext) request.getAsyncContext()).complete();
+
+        final ApiAccessLogRecord record = records.getFirst();
+        assertThat(record.resBody()).contains("실패");
+        assertThat(record.error()).contains("SSE error");
+    }
+
+    private ApiAccessLogFilter sseFilter(String... properties) {
+        final ApiAccessLogProperties props = TestProperties.of(properties);
+        return new ApiAccessLogFilter(props, new CapturePolicy(props),
+                new BodyMasker(props, JsonMapper.builder().build()), records::add);
+    }
+
+    private static MockHttpServletRequest sseRequest() {
+        final MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/v1/stream");
+        request.addHeader("Accept", MediaType.TEXT_EVENT_STREAM_VALUE);
+        request.setAsyncSupported(true);
+        return request;
     }
 
     @Test
@@ -136,11 +233,6 @@ class ApiAccessLogFilterTest {
         @GetMapping("/api/v1/large")
         Map<String, Object> large() {
             return Map.of("data", "x".repeat(500));
-        }
-
-        @GetMapping(path = "/api/v1/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-        SseEmitter stream() {
-            return new SseEmitter();
         }
 
         @GetMapping({"/actuator/health", "/health"})

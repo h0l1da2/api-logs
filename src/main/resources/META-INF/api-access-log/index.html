@@ -401,7 +401,9 @@
         ${kv('client IP', esc(r.clientIp || '-'))}
         ${kv('requestId', `<span class="mono">${esc(r.requestId || '-')}</span>`)}
         ${kv('기록 id', `<span class="mono">${esc(r.id)}</span>`)}
-        ${r.skipReason ? kv('본문 제외', esc(r.skipReason)) : ''}
+        ${r.skipReason === 'SSE' && r.resBody
+          ? kv('SSE', '스트림 중 마지막 done/error 이벤트 data만 저장')
+          : r.skipReason ? kv('본문 제외', esc(r.skipReason)) : ''}
         ${r.error ? kv('에러', `<span class="mono" style="color:var(--err)">${esc(r.error)}</span>`) : ''}
       </dl>
       <div class="tabs">
